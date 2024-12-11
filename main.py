@@ -73,7 +73,7 @@ def generate_sql(state: GraphState) -> GraphState:
             HumanMessage(content=state["messages"][-1].content)
         ]
         
-    llm = ChatOpenAI(temperature=0)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     response = llm.invoke(messages)
     sql_query = response.content.strip()
     
