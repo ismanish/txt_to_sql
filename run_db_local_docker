@@ -1,0 +1,19 @@
+1. Create a Docker Command
+Run the following command to start Adminer:
+
+bash
+Copy code
+docker run -d \
+  --name adminer \
+  -p 8080:8080 \
+  adminer
+
+  
+2. Access Adminer
+Open your browser and go to http://localhost:8080.
+Enter your database details:
+System: PostgreSQL
+Server: host.docker.internal (to connect to localhost)
+Username: Your database username
+Password: Your database password
+Database: Your database name
