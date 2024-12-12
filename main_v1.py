@@ -15,6 +15,7 @@ import json
 from sql_logger import sql_logger
 from decimal import Decimal
 import re
+from datetime import datetime
 
 load_dotenv()
 
@@ -506,6 +507,17 @@ def generate_response(state: GraphState) -> Dict:
                 user_question = message["content"]
                 break
                 
+        # Convert datetime objects to string in query results
+        serializable_results = []
+        for row in state.query_result:
+            serialized_row = {}
+            for key, value in row.items():
+                if isinstance(value, datetime):
+                    serialized_row[key] = value.isoformat()
+                else:
+                    serialized_row[key] = value
+            serializable_results.append(serialized_row)
+                
         # Create messages for response generation
         response_messages = [
             SystemMessage(content="""You are a helpful database assistant. Generate responses following these rules:
@@ -521,7 +533,7 @@ def generate_response(state: GraphState) -> Dict:
             
             HumanMessage(content=f"""Question: {user_question}
 SQL Query: {state.sql_query}
-Query Results: {json.dumps(state.query_result, indent=2)}
+Query Results: {json.dumps(serializable_results, indent=2)}
 
 Generate a clear response that presents ALL the results in an organized way.""")
         ]
