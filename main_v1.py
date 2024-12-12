@@ -225,42 +225,73 @@ def generate_sql(state: GraphState) -> Dict:
         inspector = DVDRentalInspector()
         schema_info = inspector.get_schema_for_prompt()
         
+        # First generate the SQL query with analysis
         sql_messages = [
-            SystemMessage(content=f"""You are a PostgreSQL expert. Generate precise SQL queries following these guidelines:
+            SystemMessage(content=f"""You are a PostgreSQL expert. Generate SQL queries and analyze their correctness.
 
 Database Schema:
 {schema_info}
 
-Query Generation Rules:
-1. Use EXACT table and column names from the schema
-2. For text searches:
-   - Use exact matches first (=)
-   - Avoid using LIKE with wildcards unless specifically asked
-   - Let the pattern matcher handle similar matches
-3. For time-based queries:
-   - Use appropriate date/time functions
-   - Consider data ranges carefully
-4. For aggregations:
-   - Group by all non-aggregated columns
-   - Use HAVING for post-aggregation filtering
-5. Always include proper table aliases
-6. Return ONLY the SQL query without explanations"""),
+Instructions:
+1. First, generate a SQL query following these rules:
+   - Use EXACT table and column names
+   - Use proper JOINs and relationships
+   - Handle aggregations correctly
+   - Include appropriate GROUP BY clauses
+   - Use window functions when needed
+
+2. Then, analyze if the query fully satisfies the requirements:
+   - Check if all grouping conditions are met
+   - Verify if rankings are handled correctly
+   - Ensure all filters are properly applied
+
+Return a JSON response:
+{{
+    "query": "your SQL query here",
+    "is_correct": boolean,
+    "issues": string[] | null,
+    "corrected_query": string | null
+}}
+
+If the generated query doesn't fully meet requirements, set is_correct=false and provide a corrected_query."""),
             
             HumanMessage(content=f"""Previous Question: {context['context']}
 Current Question: {context['current_question']}
 
-Generate a precise SQL query that:
+Generate and analyze a SQL query that:
 1. Follows the schema exactly
-2. Uses exact matches for text
-3. Returns complete, accurate results""")
+2. Handles all grouping requirements
+3. Applies correct rankings and filters""")
         ]
         
         sql_response = llm.invoke(sql_messages)
-        sql_query = clean_sql_response(sql_response.content)
-        
-        if not sql_query:
-            return {"error": "Failed to generate valid SQL query"}
+        try:
+            response_data = json.loads(clean_json_response(sql_response.content))
+            sql_query = response_data.get("query", "")
             
+            if not sql_query:
+                return {"error": "Failed to generate valid SQL query"}
+            
+            sql_logger.log_step("SQL Generation Analysis",
+                              analysis_result=response_data)
+            
+            # If LLM indicates query is incorrect or needs improvement
+            if not response_data.get("is_correct", True) or response_data.get("corrected_query"):
+                state.original_sql = sql_query
+                state.sql_query = sql_query
+                state.error_messages = response_data.get("issues", ["Query does not fully meet requirements"])
+                
+                # Trigger recovery with the issues
+                recovery_result = recover_sql_error(state)
+                if "error" not in recovery_result:
+                    sql_query = recovery_result["sql_query"]
+            
+        except (json.JSONDecodeError, AttributeError) as e:
+            # If JSON parsing fails, use the raw SQL query
+            sql_query = clean_sql_response(sql_response.content)
+            sql_logger.log_step("SQL Generation",
+                              error=f"Failed to parse analysis response: {str(e)}")
+        
         sql_logger.log_step("Initial SQL Generation",
                           previous_question=context["context"],
                           current_question=context["current_question"],
@@ -270,10 +301,10 @@ Generate a precise SQL query that:
             "sql_query": sql_query
         }
 
-        
     except Exception as e:
         sql_logger.log_error("SQL Generation", str(e))
         return {"error": str(e)}
+
 
 def recover_sql_error(state: GraphState) -> Dict:
     """Attempt to recover from SQL execution errors."""
@@ -372,6 +403,7 @@ def recover_sql_error(state: GraphState) -> Dict:
         sql_logger.log_error("SQL Recovery", str(e))
         return {"error": str(e)}
 
+
 def final_sql_correction(state: GraphState) -> Dict:
     """Final attempt to correct SQL query after multiple failures."""
     try:
@@ -437,6 +469,7 @@ def final_sql_correction(state: GraphState) -> Dict:
         sql_logger.log_error("Final SQL Correction", str(e))
         return {"error": str(e)}
 
+
 def generate_response(state: GraphState) -> Dict:
     """Generate a natural language response based on the SQL query and results."""
     try:
@@ -454,16 +487,20 @@ def generate_response(state: GraphState) -> Dict:
                 
         # Create messages for response generation
         response_messages = [
-            SystemMessage(content="""You are a helpful database assistant. When responding:
-            1. Always mention if the user's search term wasn't found in the database
-            2. Use the exact values that were actually used in the SQL query
-            3. Explain when you had to use a close match instead of the original search term"""),
+            SystemMessage(content="""You are a helpful database assistant. Generate responses following these rules:
+1. Present the results in a clear, organized format
+2. Group results by year when dealing with yearly data
+3. Include all relevant fields from the results
+4. If the query uses window functions or rankings, explain the ranking criteria
+5. Format the output to be easily readable
+6. Don't say 'not found in database' if you have valid results
+7. Focus on presenting the actual query results"""),
             
             HumanMessage(content=f"""Question: {user_question}
-            Original SQL: {state.sql_query}
-            Executed SQL: {state.pattern_corrected_query if hasattr(state, 'pattern_corrected_query') else state.sql_query}
-            Query Results: {json.dumps(state.query_result, indent=2)}
-            Suggestions: {json.dumps(state.suggestions, indent=2) if hasattr(state, 'suggestions') else 'None'}""")
+SQL Query: {state.sql_query}
+Query Results: {json.dumps(state.query_result, indent=2)}
+
+Generate a clear response that presents the results in an organized way.""")
         ]
         
         response = llm.invoke(response_messages)
@@ -474,6 +511,7 @@ def generate_response(state: GraphState) -> Dict:
     except Exception as e:
         sql_logger.log_error("Response Generation", str(e))
         return {"error": str(e)}
+
 
 def process_dvd_rental_query(state: GraphState) -> Dict:
     """Process a DVD rental database query through multiple attempts if needed."""
