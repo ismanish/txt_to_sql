@@ -188,6 +188,33 @@ if __name__ == "__main__":
     # Suppose you have a query that tries to find a film by a slightly misspelled title:
     # Test query
     query = "SELECT * FROM film WHERE title = 'ALIEN CENR' AND category.name LIKE '%Comed%' AND last_name = 'Smith' AND first_name = 'John'"
+    query = """
+WITH rated_films AS (
+    SELECT 
+        f.film_id,
+        f.title,
+        f.rating,
+        COUNT(f.film_id) AS rating_count
+    FROM 
+        film f
+        INNER JOIN film_category fc ON f.film_id = fc.film_id
+        INNER JOIN category c ON fc.category_id = c.category_id
+    WHERE 
+        c.name = 'Adventure' AND f.rating IS NOT NULL
+    GROUP BY 
+        f.film_id, f.title, f.rating
+)
+SELECT 
+    rf.film_id,
+    rf.title,
+    rf.rating,
+    rf.rating_count
+FROM 
+    rated_films rf
+ORDER BY 
+    rf.rating_count DESC
+LIMIT 5;
+    """
     print(query)    
     # This should find two patterns: one for film.title = 'ACADMY DINOSAURE' and one for category.name LIKE '%Comed%'
     corrected_query, suggestions = extractor.recover_query(query)
