@@ -3,6 +3,20 @@ from typing import List
 from langchain.schema.messages import SystemMessage, HumanMessage, AIMessage
 from main_v1 import process_dvd_rental_query, GraphState
 
+def format_suggestions(suggestions):
+    """Format suggestions into a readable string."""
+    if not suggestions:
+        return ""
+        
+    formatted = "\nSuggestions for query correction:"
+    for column_key, data in suggestions.items():
+        formatted += f"\nFor {column_key}:"
+        formatted += f"\n  Original value: '{data['original']}'"
+        formatted += f"\n  Suggested matches:"
+        for match, score in data['matches']:
+            formatted += f"\n    - '{match}' (confidence: {score}%)"
+    return formatted
+
 def print_welcome():
     """Print welcome message."""
     print("\nDVD Rental Database Chat Assistant")
@@ -35,14 +49,21 @@ def main():
                 messages=messages,
                 sql_query="",
                 query_result=[],
-                final_response=""
+                final_response="",
+                suggestions=None
             )
             
             result = process_dvd_rental_query(state)
-            print("\nAssistant:", result["final_response"])
             
             # Add assistant's response to history
             messages.append(AIMessage(content=result["final_response"]))
+            
+            # Print assistant's response
+            print("\nAssistant:", result["final_response"])
+            
+            # Display suggestions if any were generated
+            if result.get("suggestions"):
+                print(format_suggestions(result["suggestions"]))
             
             # Keep only recent history (last 5 exchanges + system message)
             if len(messages) > 11:  # 1 system message + 5 pairs of messages
