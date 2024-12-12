@@ -233,10 +233,10 @@ Database Schema:
 
 Query Generation Rules:
 1. Use EXACT table and column names from the schema
-2. For questions involving "top N" or "best M per group":
-   - Use window functions (ROW_NUMBER, RANK, DENSE_RANK) for ranking within groups
-   - Use CTEs for complex rankings or multi-step logic
-   - Filter window function results to get the desired top N items
+2. For text searches:
+   - Use exact matches first (=)
+   - Avoid using LIKE with wildcards unless specifically asked
+   - Let the pattern matcher handle similar matches
 3. For time-based queries:
    - Use appropriate date/time functions
    - Consider data ranges carefully
@@ -244,21 +244,15 @@ Query Generation Rules:
    - Group by all non-aggregated columns
    - Use HAVING for post-aggregation filtering
 5. Always include proper table aliases
-6. Return ONLY the SQL query without explanations
-
-Example Patterns (adapt to schema, don't copy directly):
-- Top N per group: WITH ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY rank_col) AS rn)
-- Time windows: EXTRACT(YEAR FROM date_col) or DATE_TRUNC('year', date_col)
-- Complex joins: Start with base table, join only necessary tables"""),
+6. Return ONLY the SQL query without explanations"""),
             
             HumanMessage(content=f"""Previous Question: {context['context']}
 Current Question: {context['current_question']}
 
 Generate a precise SQL query that:
 1. Follows the schema exactly
-2. Handles any grouping/ranking requirements properly
-3. Uses appropriate window functions if needed
-4. Returns complete, accurate results""")
+2. Uses exact matches for text
+3. Returns complete, accurate results""")
         ]
         
         sql_response = llm.invoke(sql_messages)
@@ -372,6 +366,7 @@ def recover_sql_error(state: GraphState) -> Dict:
         return {
             "sql_query": corrected_query
         }
+
         
     except Exception as e:
         sql_logger.log_error("SQL Recovery", str(e))
@@ -445,6 +440,11 @@ def final_sql_correction(state: GraphState) -> Dict:
 def generate_response(state: GraphState) -> Dict:
     """Generate a natural language response based on the SQL query and results."""
     try:
+        if not state.query_result:
+            return {
+                "final_response": "No results found for your query."
+            }
+            
         # Get the last user question
         user_question = ""
         for message in reversed(state.messages):
@@ -452,27 +452,27 @@ def generate_response(state: GraphState) -> Dict:
                 user_question = message["content"]
                 break
                 
-        if not user_question:
-            return {"error": "No user question found"}
-            
         # Create messages for response generation
-        messages = [
-            SystemMessage(content="You are a helpful assistant explaining SQL query results in natural language."),
-            HumanMessage(content=f"""Question: {user_question}
-            SQL Query: {state.sql_query}
-            Query Result: {state.query_result}
+        response_messages = [
+            SystemMessage(content="""You are a helpful database assistant. When responding:
+            1. Always mention if the user's search term wasn't found in the database
+            2. Use the exact values that were actually used in the SQL query
+            3. Explain when you had to use a close match instead of the original search term"""),
             
-            Explain these results in a clear, natural way.""")
+            HumanMessage(content=f"""Question: {user_question}
+            Original SQL: {state.sql_query}
+            Executed SQL: {state.pattern_corrected_query if hasattr(state, 'pattern_corrected_query') else state.sql_query}
+            Query Results: {json.dumps(state.query_result, indent=2)}
+            Suggestions: {json.dumps(state.suggestions, indent=2) if hasattr(state, 'suggestions') else 'None'}""")
         ]
         
-        # Generate natural language response
-        response = llm.invoke(messages)
-        
+        response = llm.invoke(response_messages)
         return {
             "final_response": response.content
         }
         
     except Exception as e:
+        sql_logger.log_error("Response Generation", str(e))
         return {"error": str(e)}
 
 def process_dvd_rental_query(state: GraphState) -> Dict:
@@ -495,23 +495,52 @@ def process_dvd_rental_query(state: GraphState) -> Dict:
             query_result = execute_sql(sql_query)
             state.query_result = query_result
             
+            # Check for empty results and try pattern recovery
+            if not query_result or (isinstance(query_result, list) and len(query_result) == 0):
+                sql_logger.log_step("Empty Results - Attempting Pattern Recovery",
+                                  original_query=sql_query)
+                                  
+                # Try value pattern recovery
+                corrected_query, suggestions = extractor.recover_query(sql_query)
+                
+                if suggestions:
+                    sql_logger.log_step("Value Pattern Analysis",
+                                      suggestions=suggestions,
+                                      pattern_corrected_query=corrected_query)
+                    
+                    # Execute recovered query
+                    recovered_result = execute_sql(corrected_query)
+                    if recovered_result and len(recovered_result) > 0:
+                        state.sql_query = corrected_query
+                        state.query_result = recovered_result
+                        
+                        # Generate response with suggestions
+                        response_result = generate_response(state)
+                        return {
+                            "sql_query": corrected_query,
+                            "query_result": recovered_result,
+                            "suggestions": suggestions,
+                            "final_response": response_result.get("final_response", 
+                                "Found similar matches based on your search.")
+                        }
+            
             # Log successful execution
             sql_logger.log_step("SQL Execution",
-                              sql_query=sql_query,
+                              sql_query=state.sql_query,
                               result="Success - Query executed without errors")
             
             # Generate final response
             response_result = generate_response(state)
             if "error" in response_result:
                 return {
-                    "sql_query": sql_query,
-                    "query_result": query_result,
+                    "sql_query": state.sql_query,
+                    "query_result": state.query_result,
                     "final_response": "Successfully retrieved the results, but had trouble generating a natural response."
                 }
             
             return {
-                "sql_query": sql_query,
-                "query_result": query_result,
+                "sql_query": state.sql_query,
+                "query_result": state.query_result,
                 "final_response": response_result["final_response"]
             }
             

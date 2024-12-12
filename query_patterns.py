@@ -215,6 +215,8 @@ ORDER BY
     rf.rating_count DESC
 LIMIT 5;
     """
+
+    query = """SELECT release_year FROM film WHERE title ILIKE '%RAG gams%'"""
     print(query)    
     # This should find two patterns: one for film.title = 'ACADMY DINOSAURE' and one for category.name LIKE '%Comed%'
     corrected_query, suggestions = extractor.recover_query(query)
