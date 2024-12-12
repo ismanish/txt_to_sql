@@ -238,10 +238,15 @@ Database Schema:
 {schema_info}
 
 Instructions for Searches:
-1. For follow-up questions with "and", treat it as a new independent search
-2. Never use IN clause unless explicitly asked for multiple items
-3. Each search should be a separate query
-4. For "top N per group" queries (e.g., "top N per category/year"):
+1. For relationship queries (between tables):
+   - Use the schema to determine the correct join paths
+   - Always include meaningful table aliases
+   - Join through relationship tables when needed
+   - Example: For actors in films, join through film_actor table
+2. For follow-up questions with "and", treat it as a new independent search
+3. Never use IN clause unless explicitly asked for multiple items
+4. Each search should be a separate query
+5. For "top N per group" queries (e.g., "top N per category/year"):
    - Use window functions with PARTITION BY
    - Example query structure for time-based ranges:
      WITH RankedItems AS (
@@ -253,14 +258,13 @@ Instructions for Searches:
      )
      SELECT * FROM RankedItems WHERE rank <= N
      ORDER BY [group_column] DESC, rank;
-5. Return the query in JSON format:
-{{
+6. Return the query in JSON format:
+{{{{
     "query": "your SQL query here",
     "search_type": "exact_match|pattern_match|other",
     "search_value": "the exact value being searched",
     "is_follow_up": boolean
-}}"""),
-            
+}}}}"""),            
             HumanMessage(content=f"""Previous Question: {context['context']}
 Current Question: {context['current_question']}
 
