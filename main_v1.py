@@ -12,6 +12,7 @@ from db_inspector import DVDRentalInspector
 import configparser
 from query_patterns import ValuePatternExtractor
 import json
+from sql_logger import sql_logger
 
 load_dotenv()
 
@@ -53,13 +54,24 @@ def trim_messages(messages: List[Dict[str, str]], max_messages: int = 5) -> List
     return messages[-max_messages:]
 
 
-def extract_relevant_context(messages: List[Dict[str, str]]) -> str:
-    """Extract relevant context from message history."""
-    # Get the last user message
+def extract_relevant_context(messages: List[Dict[str, str]]) -> Dict[str, str]:
+    """Extract relevant context from message history.
+    Returns a dict with current_question and context."""
+    
+    user_messages = []
     for message in reversed(messages):
         if message["role"] == "user":
-            return message["content"]
-    return ""
+            user_messages.append(message["content"].strip())
+            if len(user_messages) >= 2:
+                break
+                
+    if not user_messages:
+        return {"current_question": "", "context": ""}
+        
+    return {
+        "current_question": user_messages[0],
+        "context": user_messages[1] if len(user_messages) > 1 else ""
+    }
 
 
 def clean_sql_response(response: str) -> str:
@@ -206,61 +218,67 @@ def execute_sql(sql_query: str) -> Dict:
 def generate_sql(state: GraphState) -> Dict:
     """Generate SQL query based on user input using GPT-4 for analysis."""
     try:
-        # Get the last user question
-        user_question = ""
-        for message in reversed(state.messages):
-            if message["role"] == "user":
-                user_question = message["content"]
-                break
-                
-        if not user_question:
+        context = extract_relevant_context(state.messages)
+        if not context["current_question"]:
             return {"error": "No user question found"}
-
-        # Create messages for SQL generation
-        sql_messages = [
-            SystemMessage(content="""You are a SQL expert. Generate a PostgreSQL query to answer the user's question.
-            Use these EXACT table names:
-            - film (for movies)
-            - actor (for actors)
-            - film_actor (joins films and actors)
-            - category (for genres)
-            - film_category (joins films and categories)
-            - rental (for rental history)
-            - inventory (for stock)
             
-            Rules:
-            1. Return ONLY the SQL query, no explanations
-            2. Use proper table aliases
-            3. Include proper JOIN conditions
-            4. Handle any needed aggregations
-            5. When ranking movies by popularity:
-               - First count rentals per film using COUNT(r.rental_id)
-               - Use DENSE_RANK() or ROW_NUMBER() to rank movies
-               - Show ALL actors for each ranked movie
-            6. Use rental_count or rental_rate for popularity
-            7. ALWAYS use DISTINCT ON or appropriate window functions to show all unique combinations
-            8. ALWAYS respect the number of results requested (e.g., top 10, top 5)
-            9. If no limit is specified, default to showing ALL results"""),
-            HumanMessage(content=user_question)
+        inspector = DVDRentalInspector()
+        schema_info = inspector.get_schema_for_prompt()
+        
+        sql_messages = [
+            SystemMessage(content=f"""You are a PostgreSQL expert. Generate precise SQL queries following these guidelines:
+
+Database Schema:
+{schema_info}
+
+Query Generation Rules:
+1. Use EXACT table and column names from the schema
+2. For questions involving "top N" or "best M per group":
+   - Use window functions (ROW_NUMBER, RANK, DENSE_RANK) for ranking within groups
+   - Use CTEs for complex rankings or multi-step logic
+   - Filter window function results to get the desired top N items
+3. For time-based queries:
+   - Use appropriate date/time functions
+   - Consider data ranges carefully
+4. For aggregations:
+   - Group by all non-aggregated columns
+   - Use HAVING for post-aggregation filtering
+5. Always include proper table aliases
+6. Return ONLY the SQL query without explanations
+
+Example Patterns (adapt to schema, don't copy directly):
+- Top N per group: WITH ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY rank_col) AS rn)
+- Time windows: EXTRACT(YEAR FROM date_col) or DATE_TRUNC('year', date_col)
+- Complex joins: Start with base table, join only necessary tables"""),
+            
+            HumanMessage(content=f"""Previous Question: {context['context']}
+Current Question: {context['current_question']}
+
+Generate a precise SQL query that:
+1. Follows the schema exactly
+2. Handles any grouping/ranking requirements properly
+3. Uses appropriate window functions if needed
+4. Returns complete, accurate results""")
         ]
         
-        # Generate SQL query
         sql_response = llm.invoke(sql_messages)
         sql_query = clean_sql_response(sql_response.content)
         
         if not sql_query:
             return {"error": "Failed to generate valid SQL query"}
             
-        print("\nGenerated SQL Query:")
-        print(sql_query)
-        print()
+        sql_logger.log_step("Initial SQL Generation",
+                          previous_question=context["context"],
+                          current_question=context["current_question"],
+                          generated_sql=sql_query)
             
         return {
             "sql_query": sql_query
         }
+
         
     except Exception as e:
-        print(f"Error generating SQL: {e}")
+        sql_logger.log_error("SQL Generation", str(e))
         return {"error": str(e)}
 
 def recover_sql_error(state: GraphState) -> Dict:
@@ -276,41 +294,87 @@ def recover_sql_error(state: GraphState) -> Dict:
         if not user_question:
             return {"error": "No user question found"}
             
+        # Log initial state
+        sql_logger.log_step("SQL Error Recovery - Input",
+                          original_query=state.sql_query,
+                          error_messages=state.error_messages,
+                          user_question=user_question)
+        
+        # Get schema information
+        inspector = DVDRentalInspector()
+        schema_info = inspector.get_schema_for_prompt()
+        
+        # Try value pattern recovery
+        corrected_query, suggestions = extractor.recover_query(state.sql_query)
+        
+        sql_logger.log_step("Value Pattern Analysis",
+                          suggestions=suggestions,
+                          pattern_corrected_query=corrected_query)
+            
         # Create messages for error analysis
         error_messages = [
-            SystemMessage(content="""You are a SQL expert helping fix a failed query.
-            The database has tables: film, actor, category, film_actor, film_category, rental, customer, payment.
-            Analyze the error and suggest corrections."""),
+            SystemMessage(content=f"""You are a SQL expert helping fix a failed query.
+            
+            Database Schema:
+            {schema_info}
+            
+            Important Rules:
+            1. ALWAYS prefix column names with their table name or alias
+            2. Use proper JOIN conditions based on the schema
+            3. Handle data types correctly (especially dates and timestamps)
+            4. Use appropriate table aliases consistently
+            5. Include all necessary columns in GROUP BY
+            6. Return ONLY the working SQL query"""),
+            
             HumanMessage(content=f"""Question: {user_question}
             Failed Query: {state.sql_query}
             Error: {state.error_messages[0] if state.error_messages else 'Unknown error'}
+            Value Pattern Analysis: {json.dumps(suggestions, indent=2) if suggestions else 'No suggestions'}
             
-            What corrections are needed?""")
+            Analyze the error and suggest specific corrections based on the schema.""")
         ]
         
         # Get error analysis
         error_response = llm.invoke(error_messages)
         
-        # Create messages for correction
+        sql_logger.log_step("Error Analysis",
+                          error_analysis=error_response.content)
+        
+        # Create messages for correction with schema context
         correction_messages = [
-            SystemMessage(content="""You are a SQL expert. Generate a corrected SQL query.
-            Use exact table names: film, actor, category, film_actor, film_category, rental, customer, payment.
-            Ensure proper table names and join conditions."""),
+            SystemMessage(content=f"""You are a SQL expert generating a corrected query.
+            
+            Database Schema:
+            {schema_info}
+            
+            Rules for Query Generation:
+            1. Use exact column names from the schema
+            2. Include proper table aliases (e.g., f for film, c for customer)
+            3. Join tables using their relationship keys
+            4. Handle data types appropriately
+            5. Use CTEs for complex queries
+            6. Ensure proper aggregation and GROUP BY
+            7. Return ONLY the SQL query without explanations"""),
+            
             HumanMessage(content=f"""Question: {user_question}
             Failed Query: {state.sql_query}
             Error Analysis: {error_response.content}
             
-            Generate a corrected SQL query.""")
+            Generate a corrected SQL query using the proper schema.""")
         ]
         
         correction_response = llm.invoke(correction_messages)
         corrected_query = clean_sql_response(correction_response.content)
+        
+        sql_logger.log_step("First Recovery Attempt",
+                          corrected_query=corrected_query)
         
         return {
             "sql_query": corrected_query
         }
         
     except Exception as e:
+        sql_logger.log_error("SQL Recovery", str(e))
         return {"error": str(e)}
 
 def final_sql_correction(state: GraphState) -> Dict:
@@ -326,38 +390,56 @@ def final_sql_correction(state: GraphState) -> Dict:
         if not user_question:
             return {"error": "No user question found"}
             
-        # Create messages for final correction
-        messages = [
-            SystemMessage(content="""You are a SQL expert making a final attempt to fix a query.
-            The database has tables: film, actor, category, film_actor, film_category, rental, customer, payment.
-            Generate a simple, reliable query that will definitely work."""),
-            HumanMessage(content=f"""Question: {user_question}
-            Previous Errors: {', '.join(state.error_messages)}
+        # Get schema information
+        inspector = DVDRentalInspector()
+        schema_info = inspector.get_schema_for_prompt()
             
-            Generate a simple, reliable SQL query that will work.""")
+        sql_logger.log_step("Final SQL Correction - Input",
+                          user_question=user_question,
+                          failed_query=state.sql_query,
+                          error_history=state.error_messages)
+        
+        # Create messages for final correction attempt with schema
+        final_messages = [
+            SystemMessage(content=f"""You are a SQL expert making a final attempt to fix a failed query.
+            
+            Database Schema:
+            {schema_info}
+            
+            Critical Rules:
+            1. Use EXACT column names from the schema
+            2. Join tables ONLY on their correct relationship keys
+            3. Handle all data types properly
+            4. Use appropriate table aliases consistently
+            5. Include all necessary columns in GROUP BY
+            6. Return ONLY the working SQL query
+            
+            Common Fixes:
+            1. For date/time operations, use proper PostgreSQL date functions
+            2. For rankings, use window functions with correct PARTITION BY
+            3. For aggregations, ensure GROUP BY includes all non-aggregated columns
+            4. For joins, follow the exact relationships in the schema"""),
+            
+            HumanMessage(content=f"""Question: {user_question}
+            Failed Query: {state.sql_query}
+            Error History: {json.dumps(state.error_messages, indent=2)}
+            
+            This is the final attempt. Generate a working SQL query using the exact schema.""")
         ]
         
-        # Generate final SQL attempt
-        response = llm.invoke(messages)
-        final_query = clean_sql_response(response.content)
+        # Generate final correction
+        final_response = llm.invoke(final_messages)
+        final_query = clean_sql_response(final_response.content)
         
-        # Try to execute it
-        try:
-            result = execute_sql(final_query)
-            return {
-                "sql_query": final_query,
-                "query_result": result
-            }
-        except Exception as e:
-            return {
-                "error": str(e),
-                "sql_query": final_query,
-                "suggestions": ["Try asking about specific tables or columns",
-                              "Use simpler conditions in your question",
-                              "Specify exactly what information you want"]
-            }
-            
+        sql_logger.log_step("Final SQL Correction - Output",
+                          final_query=final_query)
+        
+        return {
+            "sql_query": final_query
+        }
+        
     except Exception as e:
+        sql_logger.log_error("Final SQL Correction", str(e))
         return {"error": str(e)}
 
 def generate_response(state: GraphState) -> Dict:
@@ -396,102 +478,79 @@ def generate_response(state: GraphState) -> Dict:
 def process_dvd_rental_query(state: GraphState) -> Dict:
     """Process a DVD rental database query through multiple attempts if needed."""
     try:
-        # First attempt with original query
+        # Reset logger status for new query
+        sql_logger.reset_status()
+        
+        # Generate initial SQL
         result = generate_sql(state)
         if "error" in result:
-            raise Exception(result["error"])
+            return {"error": result["error"]}
             
-        state.sql_query = result["sql_query"]
-        state.original_sql = result["sql_query"]  # Store original query
+        sql_query = result["sql_query"]
+        state.original_sql = sql_query
+        state.sql_query = sql_query
         
+        # Execute SQL query
         try:
-            state.query_result = execute_sql(state.sql_query)
-            if isinstance(state.query_result, dict) and "error" in state.query_result:
-                raise Exception(state.query_result["error"])
-                
+            query_result = execute_sql(sql_query)
+            state.query_result = query_result
+            
+            # Log successful execution
+            sql_logger.log_step("SQL Execution",
+                              sql_query=sql_query,
+                              result="Success - Query executed without errors")
+            
+            # Generate final response
             response_result = generate_response(state)
             if "error" in response_result:
-                raise Exception(response_result["error"])
-                
+                return {
+                    "sql_query": sql_query,
+                    "query_result": query_result,
+                    "final_response": "Successfully retrieved the results, but had trouble generating a natural response."
+                }
+            
             return {
-                "sql_query": state.sql_query,
-                "query_result": state.query_result,
+                "sql_query": sql_query,
+                "query_result": query_result,
                 "final_response": response_result["final_response"]
             }
+            
         except Exception as e:
-            # First SQL execution failed, try recovery
-            state.error_messages = [str(e)]
+            # Log execution error
+            sql_logger.log_error("SQL Execution", str(e))
+            
+            # Try to recover from error
             recovery_result = recover_sql_error(state)
+            if recovery_result.get("success"):
+                # Generate response for recovered query
+                response_result = generate_response(state)
+                return {
+                    "sql_query": state.sql_query,
+                    "query_result": state.query_result,
+                    "final_response": response_result.get("final_response", "Successfully retrieved the results after recovery.")
+                }
+                
+            # If recovery failed, try final correction
+            correction_result = final_sql_correction(state)
+            if correction_result.get("success"):
+                # Generate response for corrected query
+                response_result = generate_response(state)
+                return {
+                    "sql_query": state.sql_query,
+                    "query_result": state.query_result,
+                    "final_response": response_result.get("final_response", "Successfully retrieved the results after final correction.")
+                }
+                
+            return {
+                "error": "Failed to generate valid SQL query after multiple attempts",
+                "final_response": "I apologize, but I'm having trouble generating a working SQL query. Could you please rephrase your question?"
+            }
             
-            if "error" in recovery_result:
-                # Recovery failed, try final correction
-                state.error_messages.append(recovery_result["error"])
-                final_result = final_sql_correction(state)
-                
-                if "error" in final_result:
-                    # All attempts failed
-                    return {
-                        "sql_query": final_result.get("sql_query", ""),
-                        "query_result": [],
-                        "final_response": "I apologize, but I'm having trouble generating a working SQL query. Could you please rephrase your question?",
-                        "suggestions": final_result.get("suggestions", ["Try being more specific about what you're looking for."])
-                    }
-                
-                # Final correction worked
-                state.sql_query = final_result["sql_query"]
-                state.query_result = final_result["query_result"]
-                response_result = generate_response(state)
-                
-                return {
-                    "sql_query": state.sql_query,
-                    "query_result": state.query_result,
-                    "final_response": response_result.get("final_response", "Successfully retrieved the results, but had trouble generating a natural response.")
-                }
-            
-            # Recovery worked, try executing recovered query
-            try:
-                state.sql_query = recovery_result["sql_query"]
-                state.query_result = execute_sql(state.sql_query)
-                if isinstance(state.query_result, dict) and "error" in state.query_result:
-                    raise Exception(state.query_result["error"])
-                    
-                response_result = generate_response(state)
-                
-                return {
-                    "sql_query": state.sql_query,
-                    "query_result": state.query_result,
-                    "final_response": response_result.get("final_response", "Successfully retrieved the results."),
-                    "suggestions": recovery_result.get("suggestions")
-                }
-            except Exception as e:
-                # Recovery execution failed, try final correction
-                state.error_messages.append(str(e))
-                final_result = final_sql_correction(state)
-                
-                if "error" in final_result:
-                    return {
-                        "sql_query": final_result.get("sql_query", ""),
-                        "query_result": [],
-                        "final_response": "I apologize, but I'm having trouble generating a working SQL query. Could you please rephrase your question?",
-                        "suggestions": final_result.get("suggestions", ["Try being more specific about what you're looking for."])
-                    }
-                
-                state.sql_query = final_result["sql_query"]
-                state.query_result = final_result["query_result"]
-                response_result = generate_response(state)
-                
-                return {
-                    "sql_query": state.sql_query,
-                    "query_result": state.query_result,
-                    "final_response": response_result.get("final_response", "Successfully retrieved the results, but had trouble generating a natural response.")
-                }
-                
     except Exception as e:
+        sql_logger.log_error("Query Processing", str(e))
         return {
-            "sql_query": "",
-            "query_result": [],
-            "final_response": f"I encountered an error: {str(e)}. Could you please rephrase your question?",
-            "suggestions": ["Try being more specific about what you're looking for."]
+            "error": f"Error processing query: {str(e)}",
+            "final_response": "An error occurred while processing your query. Could you please try again?"
         }
 
 if __name__ == "__main__":
