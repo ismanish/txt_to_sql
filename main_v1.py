@@ -13,6 +13,8 @@ import configparser
 from query_patterns import ValuePatternExtractor
 import json
 from sql_logger import sql_logger
+from decimal import Decimal
+import re
 
 load_dotenv()
 
@@ -144,75 +146,77 @@ def analyze_schema_for_query(question: str) -> dict:
     Use GPT-4 to analyze the schema and determine the best approach for the query.
     Returns a dictionary with the analysis.
     """
-    schema_analyzer = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    
-    schema_prompt = """Given a DVD rental database with these EXACT table names:
-- film (NOT films)
-- actor (NOT actors)
-- film_actor
-- category
-- film_category
-- rental
-- inventory
-
-Analyze this question and determine:
-1. Which tables and joins are needed
-2. What metrics or calculations are required
-3. How to best measure concepts like 'popularity' or 'best' based on available data
-
-Question: {question}
-
-Return a JSON object in this exact format (no other text):
-{{
-    "required_tables": ["list of tables needed"],
-    "metrics": ["list of metrics to calculate"],
-    "joins": ["list of necessary joins"],
-    "ordering": "how to order results",
-    "reasoning": "brief explanation of approach"
-}}"""
-
-    messages = [
-        SystemMessage(content="You are a database expert that analyzes queries and determines the optimal approach. Return only valid JSON."),
-        HumanMessage(content=schema_prompt.format(question=question))
-    ]
-    
     try:
-        response = schema_analyzer.invoke(messages)
-        # Clean and parse the JSON response
+        inspector = DVDRentalInspector()
+        schema_info = inspector.get_schema_for_prompt()
+        
+        messages = [
+            SystemMessage(content=f"""You are a SQL query analyzer for a DVD rental database.
+            Here is the schema information:
+            {schema_info}
+            
+            Analyze the user's question and provide guidance on:
+            1. Which tables and columns are needed
+            2. Whether it's a title search query
+            3. Any specific conditions or joins required
+            
+            Return your analysis as a JSON with these fields:
+            {{
+                "tables": ["list of required tables"],
+                "columns": ["list of required columns"],
+                "is_title_search": boolean,
+                "conditions": ["list of conditions needed"],
+                "joins": ["list of required joins"]
+            }}
+            """),
+            HumanMessage(content=question)
+        ]
+        
+        response = llm.invoke(messages)
         cleaned_response = clean_json_response(response.content)
-        analysis = json.loads(cleaned_response)
-        return analysis
-    except (json.JSONDecodeError, AttributeError) as e:
-        print(f"Failed to parse JSON: {e}")
-        print(f"Raw response: {response.content}")
-        # Return a basic structure
-        return {
-            "required_tables": ["film", "actor", "film_actor", "inventory", "rental"],
-            "metrics": ["rental_count"],
-            "joins": ["film to film_actor to actor", "film to inventory to rental"],
-            "ordering": "rental_count DESC",
-            "reasoning": "Count rentals per film to measure popularity"
-        }
+        return json.loads(cleaned_response)
+        
+    except Exception as e:
+        print(f"Failed to parse analysis response: {str(e)}")
+        return None
 
 
 def execute_sql(sql_query: str) -> Dict:
     """Execute the generated SQL query against the database."""
     try:
-        conn = psycopg2.connect(**db_config)
+        # Get database configuration
+        config = configparser.ConfigParser()
+        config.read("database/database.ini")
+        db_config = config["local"]
+        
+        # Connect to the database
+        conn = psycopg2.connect(
+            host=db_config["host"],
+            database=db_config["database"],
+            user=db_config["user"],
+            password=db_config["password"]
+        )
+        
+        # Execute query with dictionary cursor
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql_query)
             results = cur.fetchall()
-        conn.close()
-        
-        query_result = [dict(row) for row in results]
-        print(f"\nSQL Query: {sql_query}")
-        print(f"Query Results: {query_result}")
-        
-        return query_result
+            
+            # Convert Decimal objects to float for JSON serialization
+            for row in results:
+                for key, value in row.items():
+                    if isinstance(value, Decimal):
+                        row[key] = float(value)
+            
+            return results
+            
     except Exception as e:
-        error_message = f"Error executing query: {str(e)}"
-        print(f"\nError: {error_message}")
-        return {"error": error_message}
+        print(f"Error executing query: {str(e)}")
+        return []
+        
+    finally:
+        if conn:
+            conn.close()
 
 
 def generate_sql(state: GraphState) -> Dict:
@@ -232,36 +236,34 @@ def generate_sql(state: GraphState) -> Dict:
 Database Schema:
 {schema_info}
 
-Instructions:
-1. First, generate a SQL query following these rules:
-   - Use EXACT table and column names
-   - Use proper JOINs and relationships
-   - Handle aggregations correctly
-   - Include appropriate GROUP BY clauses
-   - Use window functions when needed
-
-2. Then, analyze if the query fully satisfies the requirements:
-   - Check if all grouping conditions are met
-   - Verify if rankings are handled correctly
-   - Ensure all filters are properly applied
-
-Return a JSON response:
+Instructions for Searches:
+1. For follow-up questions with "and", treat it as a new independent search
+2. Never use IN clause unless explicitly asked for multiple items
+3. Each search should be a separate query
+4. For "top N per group" queries (e.g., "top N per category/year"):
+   - Use window functions with PARTITION BY
+   - Example query structure for time-based ranges:
+     WITH RankedItems AS (
+       SELECT t1.*, 
+         ROW_NUMBER() OVER (PARTITION BY [group_column] ORDER BY [order_column] DESC) as rank
+       FROM [table] t1
+       WHERE [date_column] >= [start_date]
+         AND [date_column] <= [end_date]
+     )
+     SELECT * FROM RankedItems WHERE rank <= N
+     ORDER BY [group_column] DESC, rank;
+5. Return the query in JSON format:
 {{
     "query": "your SQL query here",
-    "is_correct": boolean,
-    "issues": string[] | null,
-    "corrected_query": string | null
-}}
-
-If the generated query doesn't fully meet requirements, set is_correct=false and provide a corrected_query."""),
+    "search_type": "exact_match|pattern_match|other",
+    "search_value": "the exact value being searched",
+    "is_follow_up": boolean
+}}"""),
             
             HumanMessage(content=f"""Previous Question: {context['context']}
 Current Question: {context['current_question']}
 
-Generate and analyze a SQL query that:
-1. Follows the schema exactly
-2. Handles all grouping requirements
-3. Applies correct rankings and filters""")
+Generate a SQL query based on the schema and question. Use appropriate table joins and column names from the schema.""")
         ]
         
         sql_response = llm.invoke(sql_messages)
@@ -272,22 +274,33 @@ Generate and analyze a SQL query that:
             if not sql_query:
                 return {"error": "Failed to generate valid SQL query"}
             
-            sql_logger.log_step("SQL Generation Analysis",
-                              analysis_result=response_data)
+            # For exact match searches, try exact match first
+            if response_data.get("search_type") == "exact_match":
+                search_value = response_data.get("search_value", "").strip()
+                if search_value:
+                    # Use exact match based on the table and column from the original query
+                    table_match = re.search(r'FROM\s+(\w+)', sql_query, re.IGNORECASE)
+                    where_match = re.search(r'WHERE\s+(\w+\.\w+|\w+)\s*=', sql_query, re.IGNORECASE)
+                    
+                    if table_match and where_match:
+                        table = table_match.group(1)
+                        column = where_match.group(1)
+                        sql_query = f"SELECT * FROM {table} WHERE {column} = '{search_value}'"
             
-            # If LLM indicates query is incorrect or needs improvement
-            if not response_data.get("is_correct", True) or response_data.get("corrected_query"):
+            # Execute query and check for empty results
+            result = execute_sql(sql_query)
+            if not result and response_data.get("search_type") == "exact_match":
                 state.original_sql = sql_query
                 state.sql_query = sql_query
-                state.error_messages = response_data.get("issues", ["Query does not fully meet requirements"])
+                state.error_messages = ["No exact match found"]
                 
-                # Trigger recovery with the issues
+                # Trigger pattern matching recovery
                 recovery_result = recover_sql_error(state)
                 if "error" not in recovery_result:
                     sql_query = recovery_result["sql_query"]
             
         except (json.JSONDecodeError, AttributeError) as e:
-            # If JSON parsing fails, use the raw SQL query
+            # If parsing fails, extract search parameters from the original query
             sql_query = clean_sql_response(sql_response.content)
             sql_logger.log_step("SQL Generation",
                               error=f"Failed to parse analysis response: {str(e)}")
@@ -335,8 +348,17 @@ def recover_sql_error(state: GraphState) -> Dict:
         sql_logger.log_step("Value Pattern Analysis",
                           suggestions=suggestions,
                           pattern_corrected_query=corrected_query)
+        
+        # If we have a high confidence match from pattern analysis, use it directly
+        if suggestions and 'film.title' in suggestions:
+            matches = suggestions['film.title'].get('matches', [])
+            if matches and matches[0][1] >= 75:  # If confidence is >= 75%
+                best_match = matches[0][0]
+                return {
+                    "sql_query": f"SELECT f.film_id, f.title, f.release_year FROM film f WHERE f.title = '{best_match}'"
+                }
             
-        # Create messages for error analysis
+        # If no high confidence match, proceed with error analysis
         error_messages = [
             SystemMessage(content=f"""You are a SQL expert helping fix a failed query.
             
@@ -397,7 +419,6 @@ def recover_sql_error(state: GraphState) -> Dict:
         return {
             "sql_query": corrected_query
         }
-
         
     except Exception as e:
         sql_logger.log_error("SQL Recovery", str(e))
@@ -488,19 +509,21 @@ def generate_response(state: GraphState) -> Dict:
         # Create messages for response generation
         response_messages = [
             SystemMessage(content="""You are a helpful database assistant. Generate responses following these rules:
-1. Present the results in a clear, organized format
+1. Present ALL results in a clear, organized format
 2. Group results by year when dealing with yearly data
 3. Include all relevant fields from the results
-4. If the query uses window functions or rankings, explain the ranking criteria
-5. Format the output to be easily readable
-6. Don't say 'not found in database' if you have valid results
-7. Focus on presenting the actual query results"""),
+4. Show EVERY result returned by the query, do not skip any
+5. For each year in the results, show all movies for that year
+6. Format using markdown for better readability
+7. If showing multiple years, use headers for each year
+8. Don't say 'not found in database' if you have valid results
+9. Focus on presenting the actual query results"""),
             
             HumanMessage(content=f"""Question: {user_question}
 SQL Query: {state.sql_query}
 Query Results: {json.dumps(state.query_result, indent=2)}
 
-Generate a clear response that presents the results in an organized way.""")
+Generate a clear response that presents ALL the results in an organized way.""")
         ]
         
         response = llm.invoke(response_messages)
